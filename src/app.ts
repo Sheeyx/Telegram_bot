@@ -35,7 +35,7 @@ mongoose
       { command: 'list', description: 'Show all entries' },
       { command: 'clear', description: 'Clear all entries (admin only)' },
       { command: 'cancel', description: 'Cancel current operation' },
-      { command: 'delete', description: 'Delete an entry by ID' },
+      // { command: 'delete', description: 'Delete an entry by ID' },
     ]);
   })
   .catch((err) => console.error("❌ MongoDB connection error", err));
