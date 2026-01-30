@@ -5,7 +5,6 @@ import { nanoid } from 'nanoid';
 import mongoose from 'mongoose';
 import moment from 'moment';
 import fs from 'fs';
-import cron from 'node-cron';
 
 dotenv.config();
 const app = express();
@@ -38,26 +37,6 @@ mongoose
       { command: 'cancel', description: 'Cancel current operation' },
       // { command: 'delete', description: 'Delete an entry by ID' },
     ]);
-
-    // ========== SCHEDULED AUTO-CLEAR ==========
-    // Runs at 23:55 Asia/Seoul on days 10, 20, 30 of every month
-    cron.schedule(
-      '55 23 10,20,30 * *',
-      async () => {
-        try {
-          await sendMonthlyReportAndClear();
-        } catch (err) {
-          console.error('❌ Auto-clear job failed:', err);
-          try {
-            await bot.telegram.sendMessage(
-              ADMIN_ID,
-              `❌ Auto-clear job failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-          } catch {}
-        }
-      },
-      { timezone: 'Asia/Seoul' }
-    );
   })
   .catch((err) => console.error('❌ MongoDB connection error', err));
 
@@ -137,16 +116,13 @@ function buildDetailedReportText(entries: IEntry[], balances: Record<UserName, n
 
   const now = formatKST(new Date());
 
-  let txt =
-    `🧾 Auto-clear report (Asia/Seoul)\n` +
-    `Date/Time: ${now}\n\n`;
+  let txt = `🧾 Clear report (Asia/Seoul)\n` + `Date/Time: ${now}\n\n`;
 
   for (const name of order) {
     txt += `👤 ${name}\n\n`;
     const list = grouped[name];
-    if (list.length === 0) {
-      continue;
-    }
+    if (list.length === 0) continue;
+
     list.forEach((entry, idx) => {
       txt += `${idx + 1}.  👤 ${name}\n`;
       txt += `💵 ${formatKRW(entry.amount)}₩\n`;
@@ -162,7 +138,7 @@ function buildDetailedReportText(entries: IEntry[], balances: Record<UserName, n
   return txt;
 }
 
-async function sendMonthlyReportAndClear() {
+async function sendClearReportAndClearAll(triggeredBy?: string) {
   const { balances, entries } = await getBalances();
 
   const fileContent = buildDetailedReportText(entries, balances);
@@ -182,7 +158,9 @@ async function sendMonthlyReportAndClear() {
   await Entry.deleteMany({});
 
   // notify
-  const doneMsg = `🧹 Auto-clear completed. All entries have been cleared.`;
+  const doneMsg =
+    `🧹 Cleared. All entries have been deleted.` +
+    (triggeredBy ? `\nTriggered by: ${triggeredBy}` : '');
   for (const uid of ALLOWED_USERS) {
     try {
       await bot.telegram.sendMessage(uid, doneMsg);
@@ -359,7 +337,9 @@ bot.action(/balance_(Sheyx|Polvon)/, async (ctx) => {
     const total = entries.reduce((sum, entry) => sum + entry.amount, 0);
     let message = `💰 ${name}'s Total: ${formatKRW(total)}₩\n\n📝 Entries:\n`;
     entries.forEach((entry) => {
-      message += `🔹 ${formatKRW(entry.amount)}₩ - ${entry.note || 'No note'} (${moment(entry.time).format('YYYY-MM-DD HH:mm')})\n`;
+      message += `🔹 ${formatKRW(entry.amount)}₩ - ${entry.note || 'No note'} (${moment(entry.time).format(
+        'YYYY-MM-DD HH:mm'
+      )})\n`;
     });
 
     await ctx.reply(message);
@@ -397,7 +377,9 @@ bot.action(/list_(Sheyx|Polvon)/, async (ctx) => {
 
     let message = `📄 Entries for ${name}:\n\n`;
     entries.forEach((entry, index) => {
-      message += `${index + 1}. 💵 ${formatKRW(entry.amount)}₩\n  📝 ${entry.note || 'No note'}\n  🕒 ${moment(entry.time).format('YYYY-MM-DD HH:mm')}\n\n`;
+      message += `${index + 1}. 💵 ${formatKRW(entry.amount)}₩\n  📝 ${entry.note || 'No note'}\n  🕒 ${moment(
+        entry.time
+      ).format('YYYY-MM-DD HH:mm')}\n\n`;
     });
 
     const chunks = message.match(/[\s\S]{1,4000}/g) || [];
@@ -424,7 +406,9 @@ bot.action('list_all', async (ctx) => {
 
     let message = `📜 All Entries:\n\n`;
     entries.forEach((entry) => {
-      message += `👤 ${entry.name}\n 💵 ${formatKRW(entry.amount)}₩\n 📝 ${entry.note || 'No note'}\n 🕒 ${moment(entry.time).format('YYYY-MM-DD HH:mm')}\n\n`;
+      message += `👤 ${entry.name}\n 💵 ${formatKRW(entry.amount)}₩\n 📝 ${
+        entry.note || 'No note'
+      }\n 🕒 ${moment(entry.time).format('YYYY-MM-DD HH:mm')}\n\n`;
     });
 
     const chunks = message.match(/[\s\S]{1,4000}/g) || [];
@@ -482,8 +466,13 @@ bot.action('approve_clear', async (ctx) => {
     return ctx.reply("🚫 You're not authorized.");
   }
 
-  await Entry.deleteMany({});
-  await ctx.reply('🧹 All entries have been cleared.');
+  // ✅ send full report to both + clear
+  const triggeredBy =
+    ctx.from?.username ? `@${ctx.from.username}` : ctx.from?.first_name ? ctx.from.first_name : String(ctx.from?.id);
+
+  await sendClearReportAndClearAll(triggeredBy);
+
+  await ctx.answerCbQuery();
 
   const otherUserId = ALLOWED_USERS.find((uid) => uid !== userId);
   if (otherUserId) {
@@ -498,6 +487,7 @@ bot.action('deny_clear', async (ctx) => {
   const otherUserId = ALLOWED_USERS.find((uid) => uid !== userId);
   await bot.telegram.sendMessage(otherUserId!, '❌ The request to clear entries was denied by the other user.');
   await ctx.reply('❌ Your request to clear entries has been denied.');
+  await ctx.answerCbQuery();
 });
 
 // ========== Delete by ID (admin only) ==========
@@ -524,13 +514,15 @@ bot.command('delete', async (ctx) => {
   }
 
   await Entry.deleteOne({ id: entryId });
-  ctx.reply(`🗑️ Entry \`${entryId}\` deleted successfully.`, { parse_mode: 'Markdown' });
+  await ctx.reply(`🗑️ Entry \`${entryId}\` deleted successfully.`, { parse_mode: 'Markdown' });
 
   for (const uid of ALLOWED_USERS) {
     if (uid !== userId) {
       await bot.telegram.sendMessage(
         uid,
-        `⚠️ Entry deleted by admin:\n👤 ${entry.name}\n💵 ${formatKRW(entry.amount)}₩\n📝 ${entry.note}\n🕒 ${moment(entry.time).format('YYYY-MM-DD HH:mm')}`
+        `⚠️ Entry deleted by admin:\n👤 ${entry.name}\n💵 ${formatKRW(entry.amount)}₩\n📝 ${entry.note}\n🕒 ${moment(
+          entry.time
+        ).format('YYYY-MM-DD HH:mm')}`
       );
     }
   }
@@ -579,7 +571,9 @@ bot.on('text', async (ctx) => {
         if (uid !== userId) {
           await bot.telegram.sendMessage(
             uid,
-            `🔔 Umumiy split: total ${formatKRW(amount)}₩ → Sheyx ${formatKRW(share)}₩, Polvon ${formatKRW(share)}₩\n📝 Note: ${note}\n🕒 ${moment(new Date()).format('YYYY-MM-DD HH:mm')}`
+            `🔔 Umumiy split: total ${formatKRW(amount)}₩ → Sheyx ${formatKRW(share)}₩, Polvon ${formatKRW(
+              share
+            )}₩\n📝 Note: ${note}\n🕒 ${moment(new Date()).format('YYYY-MM-DD HH:mm')}`
           );
         }
       }
@@ -602,13 +596,17 @@ bot.on('text', async (ctx) => {
       await Session.findOneAndUpdate({ userId }, { name: null, mode: null });
 
       await ctx.reply(
-        `✅ Expenses recorded for ${session.name}: total ${formatKRW(amount)}₩ → saved ${formatKRW(half)}₩ (their half only).`
+        `✅ Expenses recorded for ${session.name}: total ${formatKRW(amount)}₩ → saved ${formatKRW(
+          half
+        )}₩ (their half only).`
       );
       for (const uid of ALLOWED_USERS) {
         if (uid !== userId) {
           await bot.telegram.sendMessage(
             uid,
-            `🔔 Expenses: ${session.name} saved ${formatKRW(half)}₩ (from total ${formatKRW(amount)}₩)\n📝 Note: ${note}\n🕒 ${moment(new Date()).format('YYYY-MM-DD HH:mm')}`
+            `🔔 Expenses: ${session.name} saved ${formatKRW(half)}₩ (from total ${formatKRW(
+              amount
+            )}₩)\n📝 Note: ${note}\n🕒 ${moment(new Date()).format('YYYY-MM-DD HH:mm')}`
           );
         }
       }
@@ -632,7 +630,9 @@ bot.on('text', async (ctx) => {
       if (uid !== userId) {
         await bot.telegram.sendMessage(
           uid,
-          `🔔 Debt added for ${session.name}: ${formatKRW(amount)}₩\n📝 Note: ${note}\n🕒 ${moment(new Date()).format('YYYY-MM-DD HH:mm')}`
+          `🔔 Debt added for ${session.name}: ${formatKRW(amount)}₩\n📝 Note: ${note}\n🕒 ${moment(
+            new Date()
+          ).format('YYYY-MM-DD HH:mm')}`
         );
       }
     }
